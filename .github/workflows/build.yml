@@ -22,7 +22,7 @@ on:
        DEVICE_CODENAME:
         description: "Device codename:"
         required: true
-        default: "apollo"
+        default: "RMX1901"
        BUILD_SCRIPT:
         description: 'Build script raw URL:'
         required: true
@@ -118,6 +118,24 @@ jobs:
     runs-on: self-hosted
     
     steps:
+    
+    - name: Send Telegram Notification - Build Started
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        message: |
+          🚀 *Build Started*
+          
+          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
+          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
+          *Clean Build:* ${{ github.event.inputs.BUILD_CLEAN }}
+          *Repository:* ${{ github.repository }}
+          *Workflow:* ${{ github.workflow }}
+          *Run ID:* ${{ github.run_id }}
+          
+          [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        format: markdown
     
     - name: Initialize build directory
       run: |
@@ -263,6 +281,43 @@ jobs:
             fi
         fi
 
+    - name: Send Telegram Notification - Build Success
+      if: success()
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        message: |
+          ✅ *Build Completed Successfully!*
+          
+          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
+          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
+          *Release:* ${{ env.RELEASENAME }}
+          *Build Date:* ${{ env.RELEASE_DATE }}
+          *File:* ${{ env.ZIP_FILE }}
+          
+          📱 [Download Release](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.run_id }})
+          🔗 [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        format: markdown
+
+    - name: Send Telegram Notification - Build Failed
+      if: failure()
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        message: |
+          ❌ *Build Failed!*
+          
+          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
+          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
+          *Repository:* ${{ github.repository }}
+          
+          Please check the logs for more details.
+          
+          🔗 [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        format: markdown
+
     - name: Execute if the job is cancelled
       if:  ${{ cancelled() }}
       run: |
@@ -270,3 +325,20 @@ jobs:
 
         crave stop --all
 
+    - name: Send Telegram Notification - Build Cancelled
+      if: cancelled()
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        message: |
+          🚫 *Build Cancelled*
+          
+          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
+          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
+          *Repository:* ${{ github.repository }}
+          
+          The build was manually cancelled or timed out.
+          
+          🔗 [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        format: markdown
