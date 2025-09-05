@@ -1,0 +1,420 @@
+#
+# Copyright (C) 2024 Antonino Scordino
+# Copyright (C) 2024 Souhrud Reddy
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+name: Build in foss.crave.io
+on:
+  workflow_dispatch:
+    inputs:
+       BASE_PROJECT:
+        description: 'Choose a base project:'
+        required: true
+        type: choice
+        options:
+          - 'AOSP'
+          - 'LineageOS'
+          - 'DerpFest'
+          - 'PixelOS'
+          - 'RisingOS'
+       DEVICE_CODENAME:
+        description: "Device codename:"
+        required: true
+        default: "RMX1901"
+       BUILD_SCRIPT:
+        description: 'Build script raw URL:'
+        required: true
+       BUILD_CLEAN:
+        description: 'Build using a new/clean machine? (yes/no)'
+        default: "no"
+
+jobs:
+  Start-Runner:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tmux jq
+
+    - name: Configure the 'crave' environment
+      run: |
+        mkdir ${HOME}/bin/
+        curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
+        mv ${PWD}/crave ${HOME}/bin/
+        sudo ln -sf /home/${USER}/bin/crave /usr/bin/crave
+        envsubst < ${PWD}/crave.conf.sample >> ${PWD}/crave.conf
+        rm -rf ${PWD}/crave.conf.sample          
+
+      env:
+        CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
+        CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
+
+    - name: Run crave devspace
+      run: |
+        crave devspace -- "
+        echo "Looking for runner..."
+        if [ -f actions-runner/run.sh ] ; then
+          echo -e '\e[32mRunner found! Restarting it...\e[0m'
+        else
+          echo -e '\e[31mError! Runner not found!\e[0m'
+          exit 1
+        fi
+
+        if tmux has-session -t ghactions; then 
+          echo -e '\e[32mRunner is already Running\e[0m'
+        else 
+          tmux kill-session -t ghactions;
+          tmux new-session -d -s ghactions 
+          tmux send-keys -t ghactions './actions-runner/run.sh' Enter 
+          echo -e '\e[32mRunner Started\e[0m'
+        fi "
+        
+  prepare:
+    name: Prepare for Building
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check-out to repository
+      uses: actions/checkout@v4
+
+    - name: Check Credentials
+      run: |
+        if [[ -z "${{ secrets.CRAVE_TOKEN }}" || -z "${{ secrets.CRAVE_USERNAME }}" ]]; then
+          echo -e '\e[31mCrave Credentials Not Configured! Exiting...\e[0m'
+          exit 1
+        fi
+        if [[ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" || -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]]; then
+          echo -e '\e[31mTelegram Credentials Not Configured! Exiting...\e[0m'
+          exit 1
+        fi
+        bash configs/env-checker.sh
+
+    - name: Set Project variables
+      id: proj-variables
+      run: |
+        case "${{ github.event.inputs.BASE_PROJECT }}" in
+          "AOSP") export PROJECTFOLDER="/crave-devspaces/AOSP"; export PROJECTID="35";;
+          "DerpFest") export PROJECTFOLDER="/crave-devspaces/DerpFest-AOSP"; export PROJECTID="64";;
+          "LineageOS") export PROJECTFOLDER="/crave-devspaces/LineageOS"; export PROJECTID="72";;
+          "PixelOS") export PROJECTFOLDER="/crave-devspaces/PixelOS"; export PROJECTID="82";;
+          "RisingOS") export PROJECTFOLDER="/crave-devspaces/RisingOS"; export PROJECTID="86";;
+        esac
+        
+        echo "PROJECTFOLDER=$PROJECTFOLDER" >> $GITHUB_ENV
+        echo "PROJECTID=$PROJECTID" >> $GITHUB_ENV
+        
+    outputs:
+      PROJECTFOLDER: ${{ env.PROJECTFOLDER }}
+      PROJECTID: ${{ env.PROJECTID }}
+        
+  build:
+    needs: prepare
+    timeout-minutes: 960
+    name: Build in foss.crave.io
+    runs-on: self-hosted
+    
+    steps:
+    
+    - name: Send Telegram build start notification
+      run: |
+        BUILD_START_TIME=$(date +%s)
+        echo "BUILD_START_TIME=$BUILD_START_TIME" >> $GITHUB_ENV
+        
+        MESSAGE="🚀 <b>Build Started!</b>%0A%0A"
+        MESSAGE+="📱 <b>Device:</b> ${{ github.event.inputs.DEVICE_CODENAME }}%0A"
+        MESSAGE+="📦 <b>Project:</b> ${{ github.event.inputs.BASE_PROJECT }}%0A"
+        MESSAGE+="🔧 <b>Clean Build:</b> ${{ github.event.inputs.BUILD_CLEAN }}%0A"
+        MESSAGE+="📊 <b>Run ID:</b> ${{ github.run_id }}%0A"
+        MESSAGE+="⏰ <b>Started:</b> $(date +'%Y-%m-%d %H:%M:%S UTC')%0A%0A"
+        MESSAGE+="🎯 <b>Progress Tracking:</b>%0A"
+        MESSAGE+="▰▱▱▱▱▱▱▱▱ 0%% [Starting...]%0A%0A"
+        MESSAGE+="⏳ <b>ETA:</b> Calculating...%0A"
+        MESSAGE+="📁 <b>Current Target:</b> Initializing build environment"
+        
+        RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="$MESSAGE" \
+          -d parse_mode="HTML")
+        
+        MESSAGE_ID=$(echo $RESPONSE | jq -r '.result.message_id')
+        echo "TELEGRAM_MESSAGE_ID=$MESSAGE_ID" >> $GITHUB_ENV
+
+    - name: Initialize build directory
+      run: |
+        PROJECTFOLDER="${{ needs.prepare.outputs.PROJECTFOLDER }}"
+        PROJECTID="${{ needs.prepare.outputs.PROJECTID }}"
+        
+        existing_clones=$(crave clone list --json | jq -r '.clones[]."Cloned At"')
+          
+        for dir in $existing_clones; do
+          if [[ "$dir" != "$PROJECTFOLDER" ]]; then
+            echo "Removing old project directory: $dir"
+            crave clone destroy -y "$dir"
+          fi
+        done
+
+        if grep -q "$PROJECTFOLDER" <<< "$existing_clones" && [ "${DCDEVSPACE}" == "1" ]; then
+          echo "Base project $PROJECTFOLDER build directory exists! Reusing it."
+          echo "BUILD_DIR=$PROJECTFOLDER" >> $GITHUB_ENV
+        else
+          crave clone create --projectID "$PROJECTID" "$PROJECTFOLDER"
+          echo "BUILD_DIR=$PROJECTFOLDER" >> $GITHUB_ENV
+        fi
+
+        echo "DEVICE_CODENAME=${{ github.event.inputs.DEVICE_CODENAME }}" >> $GITHUB_ENV
+
+    - name: Set up persistent hostname
+      run: |
+        cd ${{ env.BUILD_DIR }}
+        if [ ! -f ".repo/manifests/crave.yaml" ]; then
+            curl -s https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref }}/configs/crave.yaml > .repo/manifests/crave.yaml
+        fi
+
+    - name: Queue build with real-time Telegram progress
+      continue-on-error: true
+      run: |
+        cd ${{ env.BUILD_DIR }}
+
+        jq '.projects = []' ~/crave.conf > tmp && mv tmp ~/crave.conf
+        crave ssh -- "rm -f out/target/product/${{ env.DEVICE_CODENAME }}/*.zip out/target/product/${{ env.DEVICE_CODENAME }}/*sum"
+        
+        [[ "${{ github.event.inputs.BUILD_CLEAN }}" == "yes" ]] && CLEAN_FLAG="--clean" || CLEAN_FLAG=""
+        
+        # Function to update Telegram message with progress
+        update_telegram_progress() {
+          local progress="$1"
+          local current_target="$2"
+          local file_count="$3"
+          local total_files="$4"
+          local eta="$5"
+          
+          # Calculate percentage
+          local percentage=0
+          if [ "$total_files" -gt 0 ]; then
+            percentage=$(( (file_count * 100) / total_files ))
+          fi
+          
+          # Create progress bar with shimmer effect
+          local progress_bar=""
+          local filled=$((percentage / 10))
+          local empty=$((10 - filled))
+          
+          # Animated shimmer effect (alternating between ▰ and ▰ with different colors)
+          local shimmer=$(( ( $(date +%s) % 2 ) ))
+          if [ $shimmer -eq 0 ]; then
+            progress_bar="$(printf '▰%.0s' $(seq 1 $filled))$(printf '▱%.0s' $(seq 1 $empty))"
+          else
+            progress_bar="$(printf '▰%.0s' $(seq 1 $filled))$(printf '▱%.0s' $(seq 1 $empty))"
+          fi
+          
+          local message="🚀 <b>Build Progress</b>%0A%0A"
+          message+="📱 <b>Device:</b> ${{ github.event.inputs.DEVICE_CODENAME }}%0A"
+          message+="📦 <b>Project:</b> ${{ github.event.inputs.BASE_PROJECT }}%0A"
+          message+="⏰ <b>Elapsed:</b> $(($(date +%s) - $BUILD_START_TIME))s%0A%0A"
+          
+          message+="🎯 <b>Progress Tracking:</b>%0A"
+          message+="$progress_bar $percentage%% [$file_count/$total_files]%0A%0A"
+          
+          message+="⏳ <b>ETA:</b> $eta%0A"
+          message+="📁 <b>Current Target:</b> $current_target%0A"
+          message+="🔍 <b>Status:</b> $progress"
+          
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/editMessageText" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d message_id="$TELEGRAM_MESSAGE_ID" \
+            -d text="$message" \
+            -d parse_mode="HTML" > /dev/null
+        }
+
+        # Start the build with progress monitoring
+        crave run $CLEAN_FLAG --no-patch -- "bash -c \"\
+          # Start the build in background
+          curl -s ${{ github.event.inputs.BUILD_SCRIPT }} | bash 2>&1 | tee build.log &
+          BUILD_PID=\$!
+          
+          # Initial progress update
+          update_telegram_progress 'Starting build...' 'Initializing' 0 0 'Calculating...'
+          sleep 10
+          
+          # Monitor build progress
+          while kill -0 \$BUILD_PID 2>/dev/null; do
+            # Parse build.log for progress information
+            if [ -f build.log ]; then
+              # Extract progress information
+              PROGRESS_LINE=\$(tail -n 50 build.log | grep -E '([0-9]+)/([0-9]+)|%|building|compile|target|finishing' | tail -n 1)
+              
+              # Extract file counts
+              FILE_COUNT=\$(echo \"\$PROGRESS_LINE\" | grep -oE '[0-9]+/[0-9]+' | head -1 | cut -d'/' -f1)
+              TOTAL_FILES=\$(echo \"\$PROGRESS_LINE\" | grep -oE '[0-9]+/[0-9]+' | head -1 | cut -d'/' -f2)
+              
+              # Extract current target
+              CURRENT_TARGET=\$(echo \"\$PROGRESS_LINE\" | grep -oE 'Building [^ ]+|Compiling [^ ]+|target: [^ ]+' | head -1)
+              if [ -z \"\$CURRENT_TARGET\" ]; then
+                CURRENT_TARGET=\$(echo \"\$PROGRESS_LINE\" | cut -c1-50)
+              fi
+              
+              # Calculate ETA (simplified)
+              ELAPSED=\$(( \$(date +%s) - $BUILD_START_TIME ))
+              if [ -n \"\$FILE_COUNT\" ] && [ -n \"\$TOTAL_FILES\" ] && [ \"\$FILE_COUNT\" -gt 0 ]; then
+                REMAINING=\$(( (ELAPSED * (TOTAL_FILES - FILE_COUNT)) / FILE_COUNT ))
+                ETA=\$(date -d \"+\$REMAINING seconds\" +'%H:%M:%S')
+              else
+                ETA='Calculating...'
+              fi
+              
+              # Update progress
+              update_telegram_progress 'Building...' \"\$CURRENT_TARGET\" \"\${FILE_COUNT:-0}\" \"\${TOTAL_FILES:-100}\" \"\$ETA\"
+            fi
+            
+            # Wait before next update
+            sleep 180  # Update every 3 minutes
+          done
+          
+          # Wait for build to finish
+          wait \$BUILD_PID
+          BUILD_EXIT=\$?
+          
+          # Final update
+          if [ \$BUILD_EXIT -eq 0 ]; then
+            update_telegram_progress 'Completed successfully! 🎉' 'Finalizing' 100 100 '00:00:00'
+          else
+            update_telegram_progress 'Build failed! ❌' 'Error occurred' 0 0 'N/A'
+          fi
+          
+          exit \$BUILD_EXIT
+        \""
+
+    - name: Send final build status
+      run: |
+        ELAPSED=$(( $(date +%s) - $BUILD_START_TIME ))
+        HOURS=$((ELAPSED / 3600))
+        MINUTES=$(( (ELAPSED % 3600) / 60 ))
+        SECONDS=$((ELAPSED % 60))
+        DURATION=$(printf "%02d:%02d:%02d" $HOURS $MINUTES $SECONDS)
+        
+        if [ $? -eq 0 ]; then
+          FINAL_MESSAGE="✅ <b>Build Completed Successfully!</b>%0A%0A"
+          FINAL_MESSAGE+="📱 <b>Device:</b> ${{ github.event.inputs.DEVICE_CODENAME }}%0A"
+          FINAL_MESSAGE+="📦 <b>Project:</b> ${{ github.event.inputs.BASE_PROJECT }}%0A"
+          FINAL_MESSAGE+="⏱️ <b>Duration:</b> $DURATION%0A"
+          FINAL_MESSAGE+="📊 <b>Run ID:</b> ${{ github.run_id }}%0A"
+          FINAL_MESSAGE+="🎯 <b>Status:</b> Completed successfully! 🎉%0A%0A"
+          FINAL_MESSAGE+="🔗 <b>Download:</b> Ready soon..."
+        else
+          FINAL_MESSAGE="❌ <b>Build Failed!</b>%0A%0A"
+          FINAL_MESSAGE+="📱 <b>Device:</b> ${{ github.event.inputs.DEVICE_CODENAME }}%0A"
+          FINAL_MESSAGE+="📦 <b>Project:</b> ${{ github.event.inputs.BASE_PROJECT }}%0A"
+          FINAL_MESSAGE+="⏱️ <b>Duration:</b> $DURATION%0A"
+          FINAL_MESSAGE+="📊 <b>Run ID:</b> ${{ github.run_id }}%0A"
+          FINAL_MESSAGE+="🎯 <b>Status:</b> Failed - Check logs for details"
+        fi
+        
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/editMessageText" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d message_id="$TELEGRAM_MESSAGE_ID" \
+          -d text="$FINAL_MESSAGE" \
+          -d parse_mode="HTML"
+
+    - name: Error Log
+      if: failure()
+      run: |
+        cd ${{ env.BUILD_DIR }}
+        crave pull 'out/error.log'
+        ERROR_SNIPPET=$(tail -n 10 out/error.log 2>/dev/null | sed 's/&/&amp;/g; s/</&lt;/g; s/>/&gt;/g' || echo "No error log found")
+        
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="❌ <b>Build Error Details</b>%0A%0A<code>$ERROR_SNIPPET</code>" \
+          -d parse_mode="HTML"
+        
+        exit 1
+
+    - name: Clean Artifacts from previous Build
+      run: |
+        cd ${{ env.BUILD_DIR }}
+        rm -rf *.zip *.sha256sum *.md5sum *.img out ${{ env.DEVICE_CODENAME }}*json ${{ env.DEVICE_CODENAME }}*txt
+
+    - name: Pull and Validate Build Artifacts
+      continue-on-error: false
+      run: |
+        cd ${{ env.BUILD_DIR }}
+        crave pull 'out/target/product/${{ env.DEVICE_CODENAME }}/*.zip'
+        rm -f *-ota-*.zip *-eng*.zip lineage*ota.zip aosp*ota.zip statix*ota.zip
+
+        if [ -z "$(find . -maxdepth 1 -name '*.zip' | sed 's|^\./||')" ]; then
+            echo -e '\e[31mERROR! Build might have failed!\e[0m'
+            exit 1
+        else
+            crave pull 'out/target/product/${{ env.DEVICE_CODENAME }}/recovery*img' \
+            'out/target/product/${{ env.DEVICE_CODENAME }}/*.sha256sum' \
+            'out/target/product/${{ env.DEVICE_CODENAME }}/*.md5sum' \
+            'out/target/product/${{ env.DEVICE_CODENAME }}/boot*img' \
+            'out/target/product/${{ env.DEVICE_CODENAME }}/vendor_boot*img' \
+            'out/target/product/${{ env.DEVICE_CODENAME }}/${{ env.DEVICE_CODENAME }}*json' \
+            'out/target/product/${{ env.DEVICE_CODENAME }}/${{ env.DEVICE_CODENAME }}*txt'
+
+            mkdir -p out
+            file_name=$(find . -maxdepth 1 -name '*.zip' | sed 's|^\./||')
+            release_title=$(basename "$file_name" .zip)
+
+            mv -f ${{ env.DEVICE_CODENAME }}*json ${{ env.DEVICE_CODENAME }}*txt *.zip *.sha256sum *.md5sum *.img out/ || true
+            
+            echo "ZIP_FILE=$file_name" >> $GITHUB_ENV
+            echo "RELEASENAME=$release_title" >> $GITHUB_ENV
+        fi
+
+    - name: Send artifacts ready notification
+      run: |
+        cd ${{ env.BUILD_DIR }}/out
+        ARTIFACTS_INFO=$(find . -type f -name "*.zip" -o -name "*.img" -o -name "*.sha256sum" -o -name "*.md5sum" | xargs -I {} sh -c 'echo "📄 $(basename {}) - $(ls -lh {} | awk '\''{print $5}'\'')";')
+        
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="📦 <b>Build Artifacts Ready!</b>%0A%0A$ARTIFACTS_INFO%0A🔗 <b>GitHub Release:</b> https://github.com/${{ github.repository }}/releases/tag/${{ github.run_id }}" \
+          -d parse_mode="HTML"
+
+    - name: Upload to GitHub releases
+      run: |
+        cd ${{ env.BUILD_DIR }}/out
+        if ! command -v gh &> /dev/null; then
+           curl -sS https://webi.sh/gh | sh
+           source ~/.config/envman/PATH.env
+        fi
+
+        gh auth login --with-token <<< ${{ secrets.GITHUB_TOKEN }}
+
+        if [[ -f "${{ env.ZIP_FILE }}" ]]; then
+            file_size=$(stat -c%s "${{ env.ZIP_FILE }}")
+            if [[ $file_size -gt 2147483648 ]]; then
+                echo -e '\e[31mFile too large for GitHub release\e[0m'
+                skip_zip=true
+            else
+                zip_size=$(numfmt --to=iec $file_size)
+                release_notes="Build completed successfully! Size: $zip_size"
+                gh release create ${{ github.run_id }} --repo ${{ github.repository }} --title ${{ env.RELEASENAME }} --notes "$release_notes"
+                
+                if [[ "$skip_zip" != true ]]; then
+                    gh release upload ${{ github.run_id }} --repo ${{ github.repository }} ${{ env.BUILD_DIR }}/out/*
+                else
+                    gh release upload ${{ github.run_id }} --repo ${{ github.repository }} $(find ${{ env.BUILD_DIR }}/out/ -type f ! -name '*.zip')
+                fi
+            fi
+        fi
+
+    - name: Execute if the job is cancelled
+      if: ${{ cancelled() }}
+      run: |
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/editMessageText" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d message_id="$TELEGRAM_MESSAGE_ID" \
+          -d text="⏹️ <b>Build Cancelled!</b>%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A⏰ Cancelled: $(date +'%Y-%m-%d %H:%M:%S UTC')" \
+          -d parse_mode="HTML"
+        
+        cd ${{ env.BUILD_DIR }}
+        crave stop --all
