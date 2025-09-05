@@ -50,7 +50,7 @@ jobs:
         curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
         mv ${PWD}/crave ${HOME}/bin/
         sudo ln -sf /home/${USER}/bin/crave /usr/bin/crave
-        envsubst < ${PWD}/crave.conf.sample >> ${PWD}/crave.conf
+        envsubst < ${PWD}/crave.conf.sample >> ${PATH}/crave.conf
         rm -rf ${PWD}/crave.conf.sample          
 
       env:
@@ -119,24 +119,14 @@ jobs:
     
     steps:
     
-    - name: Send Telegram Notification - Build Started
-      uses: appleboy/telegram-action@master
-      with:
-        to: ${{ secrets.TELEGRAM_CHAT_ID }}
-        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        message: |
-          🚀 *Build Started*
-          
-          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
-          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
-          *Clean Build:* ${{ github.event.inputs.BUILD_CLEAN }}
-          *Repository:* ${{ github.repository }}
-          *Workflow:* ${{ github.workflow }}
-          *Run ID:* ${{ github.run_id }}
-          
-          [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-        format: markdown
-    
+    - name: Send Telegram build start notification
+      if: always()
+      run: |
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="🚀 Build Started!%0A%0A📱 Device: ${{ github.event.inputs.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A🔧 Clean Build: ${{ github.event.inputs.BUILD_CLEAN }}%0A📊 Run ID: ${{ github.run_id }}%0A⏰ Started: $(date +'%Y-%m-%d %H:%M:%S UTC')" \
+          -d parse_mode="HTML"
+
     - name: Initialize build directory
       run: |
         PROJECTFOLDER="${{ needs.prepare.outputs.PROJECTFOLDER }}"
@@ -181,19 +171,80 @@ jobs:
         crave ssh -- "rm -f out/target/product/${{ env.DEVICE_CODENAME }}/*.zip out/target/product/${{ env.DEVICE_CODENAME }}/*sum"
         
         echo -e '\e[32mYour build is now on queue, check it on foss.crave.io\e[0m'
+        
+        # Send queue notification
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="📋 Build Queued!%0A%0A⏳ Waiting for build to start on foss.crave.io...%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}" \
+          -d parse_mode="HTML"
+
         [[ "${{ github.event.inputs.BUILD_CLEAN }}" == "yes" ]] && CLEAN_FLAG="--clean" || CLEAN_FLAG=""
-        crave run $CLEAN_FLAG --no-patch -- "curl -s ${{ github.event.inputs.BUILD_SCRIPT }} | bash"
+        
+        # Start build with progress monitoring
+        crave run $CLEAN_FLAG --no-patch -- "bash -c \"\
+          curl -s ${{ github.event.inputs.BUILD_SCRIPT }} | bash &\
+          BUILD_PID=\$!\
+          \
+          # Function to send Telegram updates
+          send_telegram_update() {\
+            local message=\$1\
+            curl -s -X POST 'https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage' \
+              -d chat_id='${{ secrets.TELEGRAM_CHAT_ID }}' \
+              -d text=\"\$message\" \
+              -d parse_mode='HTML' > /dev/null\
+          }\
+          \
+          # Monitor build progress
+          while kill -0 \$BUILD_PID 2>/dev/null; do\
+            # Check build status every 5 minutes
+            sleep 300\
+            \
+            # Get current build progress from log files
+            if [ -f out/build.log ]; then\
+              PROGRESS=\$(tail -n 50 out/build.log | grep -i 'building\|compiling\|%\|completed\|finish' | tail -n 1)\
+              if [ ! -z \"\$PROGRESS\" ]; then\
+                send_telegram_update \"🔄 Build Progress Update%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A📊 Status: %0A\$(echo \$PROGRESS | cut -c1-1000)\"%0A⏰ Time: \$(date +'%H:%M:%S UTC')\"\
+              fi\
+            fi\
+          done\
+          \
+          wait \$BUILD_PID\
+          BUILD_EXIT=\$?\
+          \
+          if [ \$BUILD_EXIT -eq 0 ]; then\
+            send_telegram_update \"✅ Build Completed Successfully!%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A⏰ Finished: \$(date +'%Y-%m-%d %H:%M:%S UTC')\"\
+          else\
+            send_telegram_update \"❌ Build Failed!%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A⏰ Failed: \$(date +'%Y-%m-%d %H:%M:%S UTC')%0A🔍 Exit Code: \$BUILD_EXIT\"\
+          fi\
+          exit \$BUILD_EXIT\
+        \""
+
+    - name: Send build completion notification
+      if: success()
+      run: |
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="🎉 Build Completed Successfully!%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A⏰ Duration: $((GITHUB_JOB_END_TIME - GITHUB_JOB_START_TIME)) seconds%0A📊 Run ID: ${{ github.run_id }}%0A🔗 GitHub: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          -d parse_mode="HTML"
 
     - name: Error Log
-      continue-on-error: true
+      if: failure()
       run: |
         cd ${{ env.BUILD_DIR }}
 
         crave pull 'out/error.log'
         echo "Displaying error.log"
         cat out/error.log
+        
+        # Send error notification with log snippet
+        ERROR_SNIPPET=$(tail -n 10 out/error.log | sed 's/&/&amp;/g; s/</&lt;/g; s/>/&gt;/g')
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="❌ Build Failed with Errors!%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A⏰ Failed: $(date +'%Y-%m-%d %H:%M:%S UTC')%0A%0A🔍 Last 10 lines of error log:%0A<code>$ERROR_SNIPPET</code>" \
+          -d parse_mode="HTML"
+        
         rm -rf out
-        exit 0
+        exit 1
 
     - name: Clean Artifacts from previous Build
       run: |
@@ -242,6 +293,17 @@ jobs:
         echo "File details:"
         find . -type f -exec ls -lh {} \; | awk '{print $9 ": " $5}'
 
+    - name: Send artifacts ready notification
+      run: |
+        cd ${{ env.BUILD_DIR }}/out
+        
+        ARTIFACTS_INFO=$(find . -type f -name "*.zip" -o -name "*.img" -o -name "*.sha256sum" -o -name "*.md5sum" | xargs -I {} sh -c 'echo "📄 $(basename {}) - $(ls -lh {} | awk '\''{print $5}'\'')";')
+        
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="📦 Build Artifacts Ready!%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A%0A📊 Generated Files:%0A$ARTIFACTS_INFO%0A🔗 GitHub Release: https://github.com/${{ github.repository }}/releases/tag/${{ github.run_id }}" \
+          -d parse_mode="HTML"
+
     - name: Upload to GitHub releases
       run: |
         cd ${{ env.BUILD_DIR }}/out
@@ -281,64 +343,15 @@ jobs:
             fi
         fi
 
-    - name: Send Telegram Notification - Build Success
-      if: success()
-      uses: appleboy/telegram-action@master
-      with:
-        to: ${{ secrets.TELEGRAM_CHAT_ID }}
-        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        message: |
-          ✅ *Build Completed Successfully!*
-          
-          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
-          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
-          *Release:* ${{ env.RELEASENAME }}
-          *Build Date:* ${{ env.RELEASE_DATE }}
-          *File:* ${{ env.ZIP_FILE }}
-          
-          📱 [Download Release](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.run_id }})
-          🔗 [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-        format: markdown
-
-    - name: Send Telegram Notification - Build Failed
-      if: failure()
-      uses: appleboy/telegram-action@master
-      with:
-        to: ${{ secrets.TELEGRAM_CHAT_ID }}
-        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        message: |
-          ❌ *Build Failed!*
-          
-          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
-          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
-          *Repository:* ${{ github.repository }}
-          
-          Please check the logs for more details.
-          
-          🔗 [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-        format: markdown
-
     - name: Execute if the job is cancelled
-      if:  ${{ cancelled() }}
+      if: ${{ cancelled() }}
       run: |
         cd ${{ env.BUILD_DIR }}
 
-        crave stop --all
+        # Send cancellation notification
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="⏹️ Build Cancelled!%0A%0A📱 Device: ${{ env.DEVICE_CODENAME }}%0A📦 Project: ${{ github.event.inputs.BASE_PROJECT }}%0A⏰ Cancelled: $(date +'%Y-%m-%d %H:%M:%S UTC')%0A🔗 Run ID: ${{ github.run_id }}" \
+          -d parse_mode="HTML"
 
-    - name: Send Telegram Notification - Build Cancelled
-      if: cancelled()
-      uses: appleboy/telegram-action@master
-      with:
-        to: ${{ secrets.TELEGRAM_CHAT_ID }}
-        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        message: |
-          🚫 *Build Cancelled*
-          
-          *Project:* ${{ github.event.inputs.BASE_PROJECT }}
-          *Device:* ${{ github.event.inputs.DEVICE_CODENAME }}
-          *Repository:* ${{ github.repository }}
-          
-          The build was manually cancelled or timed out.
-          
-          🔗 [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-        format: markdown
+        crave stop --all
